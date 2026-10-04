@@ -1,7 +1,9 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录）
- * - 五张业务表的增删改查与整库导入导出
+ * - 数据结构版本号与升级迁移逻辑
+ *   - v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录
+ *   - v2 → v3：新增修复工位 / 修复单两张表；旧工位补默认每日件数，旧在修单回填排期字段
+ * - 七张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
@@ -11,13 +13,16 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
+import { normalizeDailyCapacity, type RepairStation } from '@/types/station';
+import { todayText, type RepairOrder } from '@/types/repair';
 import { sortLosses } from './collate';
+import { damageByRubbing } from './repair';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbrubbing';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +90,8 @@ class RubbingDatabase extends Dexie {
   losses!: Table<Loss, string>;
   seals!: Table<Seal, string>;
   compares!: Table<Compare, string>;
+  repairStations!: Table<RepairStation, string>;
+  repairOrders!: Table<RepairOrder, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,7 +106,7 @@ class RubbingDatabase extends Dexie {
     });
 
     // v2：Loss 增加 charNo 与 [rubbingId+lineNo+charNo] 复合索引，并按行号顺序重建历史字位记录
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         steles: 'id, title, era, form, location, updatedAt',
         rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
@@ -127,6 +134,88 @@ class RubbingDatabase extends Dexie {
           });
         });
         await table.bulkPut(sortLosses(rebuilt));
+      });
+
+    // v3：修复室排期上线 —— 新增工位 / 修复单两表；旧工位按现有工位编出默认件数，旧在修单回填排期字段
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        steles: 'id, title, era, form, location, updatedAt',
+        rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
+        losses: 'id, rubbingId, lineNo, charNo, [rubbingId+lineNo+charNo], type, severity, updatedAt',
+        seals: 'id, rubbingId, sealType, position, updatedAt',
+        compares: 'id, steleId, rubbingIdA, rubbingIdB, conclusion, date, updatedAt',
+        repairStations: 'id, name, keeper, enabled, dailyCapacity, updatedAt',
+        repairOrders: 'id, rubbingId, steleId, status, stationId, scheduleDate, queueSeq, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now();
+        const stationTable = tx.table<Partial<RepairStation>>('repairStations');
+        const orderTable = tx.table<Partial<RepairOrder>>('repairOrders');
+
+        // 旧数据的工位没写每日件数：按现有工位逐条补默认件数
+        const stations = await stationTable.toArray();
+        if (stations.length > 0) {
+          await stationTable.bulkPut(
+            stations.map((station, index) => ({
+              name: `工位 ${index + 1}`,
+              keeper: '',
+              note: '',
+              enabled: true,
+              ...station,
+              dailyCapacity: normalizeDailyCapacity(station.dailyCapacity),
+              updatedAt: now,
+            })),
+          );
+        }
+
+        // 旧修复单字段不全：在修单回填工位与排期快照，待排单补排队序号
+        const orders = await orderTable.toArray();
+        if (orders.length > 0) {
+          const [rubbingRows, lossRows] = await Promise.all([
+            tx.table<Rubbing>('rubbings').toArray(),
+            tx.table<Loss>('losses').toArray(),
+          ]);
+          const rubbingMap = new Map(rubbingRows.map((row) => [row.id, row]));
+          const damageMap = damageByRubbing(lossRows);
+          const stationIds = stations.map((station) => String(station.id));
+          let pendingSeq = 0;
+          await orderTable.bulkPut(
+            orders.map((order) => {
+              const rubbing = order.rubbingId ? rubbingMap.get(order.rubbingId) : undefined;
+              const damage = order.rubbingId ? damageMap.get(order.rubbingId) : undefined;
+              const status = order.status === 'active' || order.status === 'returned' ? order.status : 'pending';
+              const queueSeq =
+                typeof order.queueSeq === 'number' && order.queueSeq > 0
+                  ? order.queueSeq
+                  : status === 'pending'
+                    ? ++pendingSeq
+                    : 0;
+              return {
+                scheduleDate: '',
+                lossCount: damage?.lossCount ?? 0,
+                versionNo: rubbing?.versionNo ?? 1,
+                severityScore: damage?.severityScore ?? 0,
+                requester: '',
+                reason: '',
+                repairer: '',
+                returnNote: '',
+                lastScheduledAt: 0,
+                ...order,
+                steleId: order.steleId || rubbing?.steleId || '',
+                status,
+                queueSeq,
+                // 在修单必须落在一个真实工位上；旧数据缺工位时回填到现有首个工位
+                stationId:
+                  status === 'active'
+                    ? order.stationId && stationIds.includes(order.stationId)
+                      ? order.stationId
+                      : stationIds[0] ?? ''
+                    : '',
+                updatedAt: now,
+              } as RepairOrder;
+            }),
+          );
+        }
       });
   }
 }
@@ -224,13 +313,60 @@ export async function seedDatabase(): Promise<void> {
     { id: 'cmp_0201', steleId: 'stele_02', rubbingIdA: 'rub_0201', rubbingIdB: 'rub_0202', diffCount: 1, conclusion: 'late', operator: '傅砚', date: '2026-03-08', createdAt: now - day * 3, updatedAt: now - day * 3 },
   ];
 
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await db.steles.bulkPut(steles);
-    await db.rubbings.bulkPut(rubbings);
-    await db.losses.bulkPut(losses);
-    await db.seals.bulkPut(seals);
-    await db.compares.bulkPut(compares);
-  });
+  // 修复室工位（每日件数即当天容量上限）
+  const stations: RepairStation[] = [
+    { id: 'station_01', name: '修字一号', keeper: '苏裱工', note: '擅宣纸脱酸补洞', dailyCapacity: 2, enabled: true, createdAt: now - day * 45, updatedAt: now - day * 2 },
+    { id: 'station_02', name: '修字二号', keeper: '秦裱工', note: '皮纸 / 摩崖大整张', dailyCapacity: 1, enabled: true, createdAt: now - day * 45, updatedAt: now - day * 2 },
+  ];
+
+  // 修复单：损泐条数与严重度权重为送修时快照；排期日按今天落位，便于演示容量与排队
+  const repairOrders: RepairOrder[] = [
+    {
+      id: 'ro_0101', rubbingId: 'rub_0101', steleId: 'stele_01', scheduleDate: todayText(),
+      lossCount: 3, versionNo: 1, severityScore: 6, requester: '傅砚', reason: '明拓早本，「禮」字缺笔需补',
+      queueSeq: 0, status: 'active', stationId: 'station_01', repairer: '苏裱工', returnNote: '',
+      lastScheduledAt: now - day * 1, createdAt: now - day * 2, updatedAt: now - day * 1,
+    },
+    {
+      id: 'ro_0102', rubbingId: 'rub_0102', steleId: 'stele_01', scheduleDate: todayText(),
+      lossCount: 3, versionNo: 2, severityScore: 7, requester: '傅砚', reason: '碑面斜裂需托裱',
+      queueSeq: 0, status: 'active', stationId: 'station_01', repairer: '苏裱工', returnNote: '',
+      lastScheduledAt: now - day * 1, createdAt: now - day * 2, updatedAt: now - day * 1,
+    },
+    {
+      id: 'ro_0301', rubbingId: 'rub_0301', steleId: 'stele_03', scheduleDate: todayText(),
+      lossCount: 1, versionNo: 1, severityScore: 3, requester: '傅砚', reason: '字口已平，整幅去污',
+      queueSeq: 0, status: 'active', stationId: 'station_02', repairer: '秦裱工', returnNote: '',
+      lastScheduledAt: now - day * 1, createdAt: now - day * 2, updatedAt: now - day * 1,
+    },
+    {
+      // 二号工位今日已满，此单排队等腾位（重试时损泐重者会插到前面）
+      id: 'ro_0202', rubbingId: 'rub_0202', steleId: 'stele_02', scheduleDate: '',
+      lossCount: 2, versionNo: 2, severityScore: 4, requester: '傅砚', reason: '晚拓漫漶兼细裂',
+      queueSeq: 2, status: 'pending', stationId: '', repairer: '', returnNote: '',
+      lastScheduledAt: 0, createdAt: now - day * 1, updatedAt: now - day * 1,
+    },
+    {
+      id: 'ro_0201', rubbingId: 'rub_0201', steleId: 'stele_02', scheduleDate: '',
+      lossCount: 1, versionNo: 1, severityScore: 1, requester: '傅砚', reason: '崖拓早本，仅细裂，送修备档',
+      queueSeq: 1, status: 'pending', stationId: '', repairer: '', returnNote: '',
+      lastScheduledAt: 0, createdAt: now - day * 1, updatedAt: now - day * 1,
+    },
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.repairStations, db.repairOrders],
+    async () => {
+      await db.steles.bulkPut(steles);
+      await db.rubbings.bulkPut(rubbings);
+      await db.losses.bulkPut(losses);
+      await db.seals.bulkPut(seals);
+      await db.compares.bulkPut(compares);
+      await db.repairStations.bulkPut(stations);
+      await db.repairOrders.bulkPut(repairOrders);
+    },
+  );
 }
 
 /* ------------------------------ 整库导入导出 ------------------------------ */
@@ -244,15 +380,19 @@ export interface RubbingSnapshot {
   losses: Loss[];
   seals: Seal[];
   compares: Compare[];
+  repairStations: RepairStation[];
+  repairOrders: RepairOrder[];
 }
 
 export async function exportSnapshot(): Promise<RubbingSnapshot> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, repairStations, repairOrders] = await Promise.all([
     db.steles.toArray(),
     db.rubbings.toArray(),
     db.losses.toArray(),
     db.seals.toArray(),
     db.compares.toArray(),
+    db.repairStations.toArray(),
+    db.repairOrders.toArray(),
   ]);
   return {
     app: DB_NAME,
@@ -263,6 +403,8 @@ export async function exportSnapshot(): Promise<RubbingSnapshot> {
     losses,
     seals,
     compares,
+    repairStations,
+    repairOrders,
   };
 }
 
@@ -271,7 +413,15 @@ export function validateSnapshot(input: unknown): string {
   if (typeof input !== 'object' || input === null) return '文件内容不是合法的 JSON 对象';
   const snapshot = input as Partial<RubbingSnapshot>;
   if (snapshot.app !== DB_NAME) return `备份文件不属于本项目（app=${String(snapshot.app)}）`;
-  const keys: Array<keyof RubbingSnapshot> = ['steles', 'rubbings', 'losses', 'seals', 'compares'];
+  const keys: Array<keyof RubbingSnapshot> = [
+    'steles',
+    'rubbings',
+    'losses',
+    'seals',
+    'compares',
+    'repairStations',
+    'repairOrders',
+  ];
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`;
   }
@@ -279,26 +429,38 @@ export function validateSnapshot(input: unknown): string {
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await Promise.all([
-      db.steles.clear(),
-      db.rubbings.clear(),
-      db.losses.clear(),
-      db.seals.clear(),
-      db.compares.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.repairStations, db.repairOrders],
+    async () => {
+      await Promise.all([
+        db.steles.clear(),
+        db.rubbings.clear(),
+        db.losses.clear(),
+        db.seals.clear(),
+        db.compares.clear(),
+        db.repairStations.clear(),
+        db.repairOrders.clear(),
+      ]);
+    },
+  );
 }
 
 export async function importSnapshot(snapshot: RubbingSnapshot): Promise<void> {
   await clearAllTables();
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await db.steles.bulkPut(snapshot.steles);
-    await db.rubbings.bulkPut(snapshot.rubbings);
-    await db.losses.bulkPut(snapshot.losses);
-    await db.seals.bulkPut(snapshot.seals);
-    await db.compares.bulkPut(snapshot.compares);
-  });
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.repairStations, db.repairOrders],
+    async () => {
+      await db.steles.bulkPut(snapshot.steles);
+      await db.rubbings.bulkPut(snapshot.rubbings);
+      await db.losses.bulkPut(snapshot.losses);
+      await db.seals.bulkPut(snapshot.seals);
+      await db.compares.bulkPut(snapshot.compares);
+      await db.repairStations.bulkPut(snapshot.repairStations);
+      await db.repairOrders.bulkPut(snapshot.repairOrders);
+    },
+  );
 }
 
 export async function resetDatabase(): Promise<void> {
@@ -307,40 +469,52 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, repairStations, repairOrders] = await Promise.all([
     db.steles.count(),
     db.rubbings.count(),
     db.losses.count(),
     db.seals.count(),
     db.compares.count(),
+    db.repairStations.count(),
+    db.repairOrders.count(),
   ]);
-  return { steles, rubbings, losses, seals, compares };
+  return { steles, rubbings, losses, seals, compares, repairStations, repairOrders };
 }
 
-/** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对 */
+/** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对 / 修复单，工位属修复室台账保留 */
 export async function removeSteleCascade(steleId: string): Promise<void> {
   const rubbingIds = (await db.rubbings.where('steleId').equals(steleId).toArray()).map((row) => row.id);
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
-    if (rubbingIds.length > 0) {
-      await db.losses.where('rubbingId').anyOf(rubbingIds).delete();
-      await db.seals.where('rubbingId').anyOf(rubbingIds).delete();
-    }
-    await db.rubbings.where('steleId').equals(steleId).delete();
-    await db.compares.where('steleId').equals(steleId).delete();
-    await db.steles.delete(steleId);
-  });
+  await db.transaction(
+    'rw',
+    [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.repairOrders],
+    async () => {
+      if (rubbingIds.length > 0) {
+        await db.losses.where('rubbingId').anyOf(rubbingIds).delete();
+        await db.seals.where('rubbingId').anyOf(rubbingIds).delete();
+        await db.repairOrders.where('rubbingId').anyOf(rubbingIds).delete();
+      }
+      await db.rubbings.where('steleId').equals(steleId).delete();
+      await db.compares.where('steleId').equals(steleId).delete();
+      await db.steles.delete(steleId);
+    },
+  );
 }
 
-/** 级联删除拓本 → 损泐 / 钤印 / 涉及的比对记录 */
+/** 级联删除拓本 → 损泐 / 钤印 / 涉及的比对记录 / 修复单 */
 export async function removeRubbingCascade(rubbingId: string): Promise<void> {
-  await db.transaction('rw', [db.rubbings, db.losses, db.seals, db.compares], async () => {
-    await db.losses.where('rubbingId').equals(rubbingId).delete();
-    await db.seals.where('rubbingId').equals(rubbingId).delete();
-    const compares = await db.compares.toArray();
-    const affected = compares.filter((row) => row.rubbingIdA === rubbingId || row.rubbingIdB === rubbingId);
-    if (affected.length > 0) await db.compares.bulkDelete(affected.map((row) => row.id));
-    await db.rubbings.delete(rubbingId);
-  });
+  await db.transaction(
+    'rw',
+    [db.rubbings, db.losses, db.seals, db.compares, db.repairOrders],
+    async () => {
+      await db.losses.where('rubbingId').equals(rubbingId).delete();
+      await db.seals.where('rubbingId').equals(rubbingId).delete();
+      await db.repairOrders.where('rubbingId').equals(rubbingId).delete();
+      const compares = await db.compares.toArray();
+      const affected = compares.filter((row) => row.rubbingIdA === rubbingId || row.rubbingIdB === rubbingId);
+      if (affected.length > 0) await db.compares.bulkDelete(affected.map((row) => row.id));
+      await db.rubbings.delete(rubbingId);
+    },
+  );
 }
 
 /** 重排某碑刻下拓本的版本序号，保证连续 */

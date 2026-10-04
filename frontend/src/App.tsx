@@ -8,6 +8,7 @@ import { App as AntdApp, Badge, Button, Layout, Menu, Space, Tag, Typography } f
 import {
   AppstoreOutlined,
   BookOutlined,
+  CalendarOutlined,
   DiffOutlined,
   ExportOutlined,
   FileSearchOutlined,
@@ -18,6 +19,7 @@ import { loadAll, useAppDispatch, useAppSelector } from './stores/store';
 import { selectSteles } from './stores/steleSlice';
 import { selectRubbings } from './stores/rubbingSlice';
 import { selectLosses } from './stores/lossSlice';
+import { selectRepairOrders, selectRepairStations } from './stores/repairSlice';
 import { initDatabase } from './utils/db';
 import { STELE_FORM_LABEL } from './types/stele';
 
@@ -32,6 +34,8 @@ export default function App() {
   const steles = useAppSelector(selectSteles);
   const rubbings = useAppSelector(selectRubbings);
   const losses = useAppSelector(selectLosses);
+  const repairOrders = useAppSelector(selectRepairOrders);
+  const repairStations = useAppSelector(selectRepairStations);
   const currentSteleId = useAppSelector((state) => state.stele.currentSteleId);
 
   useEffect(() => {
@@ -58,9 +62,11 @@ export default function App() {
       ? ROUTES.losses
       : location.pathname.startsWith('/compare')
         ? ROUTES.compare
-        : location.pathname.startsWith('/export')
-          ? ROUTES.export
-          : ROUTES.steles;
+        : location.pathname.startsWith('/repairs')
+          ? ROUTES.repairs
+          : location.pathname.startsWith('/export')
+            ? ROUTES.export
+            : ROUTES.steles;
 
   return (
     <Layout style={{ minHeight: '100vh', background: 'transparent' }}>
@@ -84,6 +90,7 @@ export default function App() {
             { key: ROUTES.rubbings, icon: <PrinterOutlined />, label: '拓本登记' },
             { key: ROUTES.losses, icon: <BookOutlined />, label: '损泐字位' },
             { key: ROUTES.compare, icon: <DiffOutlined />, label: '版本比对' },
+            { key: ROUTES.repairs, icon: <CalendarOutlined />, label: '送修排期' },
             { key: ROUTES.export, icon: <ExportOutlined />, label: '编目卡导出' },
           ]}
         />
@@ -94,6 +101,9 @@ export default function App() {
             </span>
             <span>拓本 {rubbings.length} 份</span>
             <span>损泐字位 {losses.length} 条</span>
+            <span>
+              修复单 {repairOrders.length} 张 · 工位 {repairStations.length} 个
+            </span>
           </Space>
         </div>
       </Sider>

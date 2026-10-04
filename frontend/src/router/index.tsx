@@ -12,6 +12,7 @@ const SteleList = lazy(() => import('../pages/SteleList'));
 const RubbingList = lazy(() => import('../pages/RubbingList'));
 const LossBoard = lazy(() => import('../pages/LossBoard'));
 const CompareView = lazy(() => import('../pages/CompareView'));
+const RepairBoard = lazy(() => import('../pages/RepairBoard'));
 const ExportView = lazy(() => import('../pages/ExportView'));
 
 export const ROUTES = {
@@ -19,6 +20,7 @@ export const ROUTES = {
   rubbings: '/rubbings',
   losses: '/losses',
   compare: '/compare',
+  repairs: '/repairs',
   export: '/export',
 } as const;
 
@@ -40,6 +42,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'rubbings', element: withSuspense(<RubbingList />) },
       { path: 'losses', element: withSuspense(<LossBoard />) },
       { path: 'compare', element: withSuspense(<CompareView />) },
+      { path: 'repairs', element: withSuspense(<RepairBoard />) },
       { path: 'export', element: withSuspense(<ExportView />) },
       { path: '*', element: <Navigate to={ROUTES.steles} replace /> },
     ],
