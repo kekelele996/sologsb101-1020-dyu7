@@ -34,9 +34,11 @@ import { loadAll } from '@/stores/store';
 import { selectSteles, setCurrentStele } from '@/stores/steleSlice';
 import { selectRubbings } from '@/stores/rubbingSlice';
 import { selectCompares, selectLosses } from '@/stores/lossSlice';
+import { selectRepairOrders, selectWorkbenches } from '@/stores/repairSlice';
 import { SEAL_TYPE_COLOR, SEAL_TYPE_LABEL, sealPositionWeight, type Seal, type SealType } from '@/types/seal';
 import { RUBBING_METHOD_LABEL, RUBBING_STATE_LABEL } from '@/types/rubbing';
 import { COMPARE_CONCLUSION_COLOR, COMPARE_CONCLUSION_LABEL } from '@/types/compare';
+import { REPAIR_STATUS_COLOR, REPAIR_STATUS_LABEL, type RepairStatus } from '@/types/repair';
 import {
   DB_NAME,
   DB_SCHEMA_VERSION,
@@ -66,6 +68,8 @@ export default function ExportView() {
   const rubbings = useAppSelector(selectRubbings);
   const losses = useAppSelector(selectLosses);
   const compares = useAppSelector(selectCompares);
+  const workbenches = useAppSelector(selectWorkbenches);
+  const repairOrders = useAppSelector(selectRepairOrders);
   const sealTable = useIdbTable<Seal>((database) => database.seals, { sortByUpdatedAt: false });
 
   const [steleId, setSteleId] = useState<string>('');
@@ -108,12 +112,14 @@ export default function ExportView() {
       losses: losses.length,
       seals: sealTable.rows.length,
       compares: compares.length,
+      workbenches: workbenches.length,
+      repairs: repairOrders.length,
       passPercent:
         compares.length === 0
           ? 0
           : Math.round((compares.filter((compare) => compare.conclusion !== 'pending').length / compares.length) * 100),
     }),
-    [compares, losses.length, rubbings.length, sealTable.rows.length, steles.length],
+    [compares, losses.length, repairOrders.length, rubbings.length, sealTable.rows.length, steles.length, workbenches.length],
   );
 
   const handleExport = async (): Promise<void> => {
@@ -240,6 +246,8 @@ export default function ExportView() {
         <StatBadge label="损泐字位" value={stat.losses} suffix="条" tone="warning" />
         <StatBadge label="钤印" value={stat.seals} suffix="方" />
         <StatBadge label="比对记录" value={stat.compares} suffix="条" tone="danger" />
+        <StatBadge label="修复工位" value={stat.workbenches} suffix="个" tone="primary" />
+        <StatBadge label="送修单" value={stat.repairs} suffix="张" tone="warning" />
         <StatBadge label="已定断代占比" value={`${stat.passPercent}%`} percent={stat.passPercent} tone="success" />
       </div>
 
@@ -354,7 +362,7 @@ export default function ExportView() {
           <Card title="整库导出" style={{ marginTop: 16 }}>
             <Space direction="vertical" size={10} style={{ width: '100%' }}>
               <Typography.Text type="secondary">
-                导出文件包含 5 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+                导出文件包含 7 张业务表（碑刻、拓本、损泐、钤印、比对、工位、送修单）全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
               </Typography.Text>
               <Space wrap>
                 <Button icon={<CloudDownloadOutlined />} onClick={() => void handleExport()}>
@@ -415,6 +423,36 @@ export default function ExportView() {
                     {compare.date} 比对结论：{COMPARE_CONCLUSION_LABEL[compare.conclusion]}（差异 {compare.diffCount} 字）
                   </Tag>
                 ))}
+            </Space>
+          </Card>
+
+          <Card title="送修台账" style={{ marginTop: 16 }} size="small">
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              <Space wrap>
+                {(['pending', 'scheduled', 'done', 'returned', 'withdrawn'] as RepairStatus[]).map((status) => (
+                  <Tag key={status} color={REPAIR_STATUS_COLOR[status]}>
+                    {REPAIR_STATUS_LABEL[status]} {repairOrders.filter((o) => o.status === status).length}
+                  </Tag>
+                ))}
+              </Space>
+              {repairOrders.filter((order) => order.steleId === activeSteleId).length === 0 ? (
+                <Typography.Text type="secondary">该碑刻下暂无送修单</Typography.Text>
+              ) : (
+                repairOrders
+                  .filter((order) => order.steleId === activeSteleId)
+                  .sort((a, b) => b.updatedAt - a.updatedAt)
+                  .map((order) => (
+                    <Space key={order.id} size={6} wrap style={{ fontSize: 12 }}>
+                      <Tag color={REPAIR_STATUS_COLOR[order.status]}>{REPAIR_STATUS_LABEL[order.status]}</Tag>
+                      <span>第 {rubbings.find((r) => r.id === order.rubbingId)?.versionNo ?? order.versionNo} 版</span>
+                      <Typography.Text type="secondary">
+                        损泐 {order.lossCount} 字位 / 权重 {order.lossWeight}
+                        {order.scheduleDate ? ` · ${order.scheduleDate}` : ''}
+                        {order.restorer ? ` · 修复师 ${order.restorer}` : ''}
+                      </Typography.Text>
+                    </Space>
+                  ))
+              )}
             </Space>
           </Card>
         </Col>
